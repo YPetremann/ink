@@ -20,6 +20,15 @@ test('text with standard color', t => {
 	t.is(output, chalk.green('Test'));
 });
 
+test('text with dim+bold', t => {
+	const output = renderToString(
+		<Text dimColor bold>
+			Test
+		</Text>,
+	);
+	t.is(output, chalk.bold.dim('Test'));
+});
+
 test('text with dimmed color', t => {
 	const output = renderToString(
 		<Text dimColor color="green">
@@ -112,4 +121,11 @@ test('remeasure text when text nodes are changed', t => {
 
 	rerender(<Test add />);
 	t.is((stdout.write as any).lastCall.args[0], 'abcx');
+});
+
+// See https://github.com/vadimdemedes/ink/issues/743
+// Without the fix, the output was ''.
+test('text with content "constructor" wraps correctly', t => {
+	const output = renderToString(<Text>constructor</Text>);
+	t.is(output, 'constructor');
 });

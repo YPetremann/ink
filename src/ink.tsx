@@ -6,16 +6,29 @@ import isInCi from 'is-in-ci';
 import autoBind from 'auto-bind';
 import signalExit from 'signal-exit';
 import patchConsole from 'patch-console';
+import {LegacyRoot} from 'react-reconciler/constants.js';
 import {type FiberRoot} from 'react-reconciler';
-import Yoga from 'yoga-wasm-web/auto';
+import Yoga from 'yoga-layout';
+import wrapAnsi from 'wrap-ansi';
 import reconciler from './reconciler.js';
 import render from './renderer.js';
 import * as dom from './dom.js';
 import logUpdate, {type LogUpdate} from './log-update.js';
 import instances from './instances.js';
 import App from './components/App.js';
+import {accessibilityContext as AccessibilityContext} from './components/AccessibilityContext.js';
 
 const noop = () => {};
+
+/**
+Performance metrics for a render operation.
+*/
+export type RenderMetrics = {
+	/**
+	Time spent rendering in milliseconds.
+	*/
+	renderTime: number;
+};
 
 export type Options = {
 	stdout: NodeJS.WriteStream;
@@ -24,16 +37,24 @@ export type Options = {
 	debug: boolean;
 	exitOnCtrlC: boolean;
 	patchConsole: boolean;
+	onRender?: (metrics: RenderMetrics) => void;
+	isScreenReaderEnabled?: boolean;
 	waitUntilExit?: () => Promise<void>;
+	maxFps?: number;
+	incrementalRendering?: boolean;
 };
 
 export default class Ink {
 	private readonly options: Options;
 	private readonly log: LogUpdate;
 	private readonly throttledLog: LogUpdate;
+	private readonly isScreenReaderEnabled: boolean;
+
 	// Ignore last render after unmounting a tree to prevent empty output before exit
 	private isUnmounted: boolean;
 	private lastOutput: string;
+	private lastOutputHeight: number;
+	private lastTerminalWidth: number;
 	private readonly container: FiberRoot;
 	private readonly rootNode: dom.DOMElement;
 	// This variable is used only in debug mode to store full static output
@@ -50,16 +71,27 @@ export default class Ink {
 		this.rootNode = dom.createNode('ink-root');
 		this.rootNode.onComputeLayout = this.calculateLayout;
 
-		this.rootNode.onRender = options.debug
+		this.isScreenReaderEnabled =
+			options.isScreenReaderEnabled ??
+			process.env['INK_SCREEN_READER'] === 'true';
+
+		const unthrottled = options.debug || this.isScreenReaderEnabled;
+		const maxFps = options.maxFps ?? 30;
+		const renderThrottleMs =
+			maxFps > 0 ? Math.max(1, Math.ceil(1000 / maxFps)) : 0;
+
+		this.rootNode.onRender = unthrottled
 			? this.onRender
-			: throttle(this.onRender, 32, {
+			: throttle(this.onRender, renderThrottleMs, {
 					leading: true,
 					trailing: true,
 				});
 
 		this.rootNode.onImmediateRender = this.onRender;
-		this.log = logUpdate.create(options.stdout);
-		this.throttledLog = options.debug
+		this.log = logUpdate.create(options.stdout, {
+			incremental: options.incrementalRendering,
+		});
+		this.throttledLog = unthrottled
 			? this.log
 			: (throttle(this.log, undefined, {
 					leading: true,
@@ -71,6 +103,8 @@ export default class Ink {
 
 		// Store last output to only rerender when needed
 		this.lastOutput = '';
+		this.lastOutputHeight = 0;
+		this.lastTerminalWidth = this.getTerminalWidth();
 
 		// This variable is used only in debug mode to store full static output
 		// so that it's rerendered every time, not just new static parts, like in non-debug mode
@@ -79,12 +113,14 @@ export default class Ink {
 		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 		this.container = reconciler.createContainer(
 			this.rootNode,
-			// Legacy mode
-			0,
+			LegacyRoot,
 			null,
 			false,
 			null,
 			'id',
+			() => {},
+			() => {},
+			() => {},
 			() => {},
 			null,
 		);
@@ -115,9 +151,25 @@ export default class Ink {
 		}
 	}
 
+	getTerminalWidth = () => {
+		// The 'columns' property can be undefined or 0 when not using a TTY.
+		// In that case we fall back to 80.
+		return this.options.stdout.columns || 80;
+	};
+
 	resized = () => {
+		const currentWidth = this.getTerminalWidth();
+
+		if (currentWidth < this.lastTerminalWidth) {
+			// We clear the screen when decreasing terminal width to prevent duplicate overlapping re-renders.
+			this.log.clear();
+			this.lastOutput = '';
+		}
+
 		this.calculateLayout();
 		this.onRender();
+
+		this.lastTerminalWidth = currentWidth;
 	};
 
 	resolveExitPromise: () => void = () => {};
@@ -125,9 +177,7 @@ export default class Ink {
 	unsubscribeExit: () => void = () => {};
 
 	calculateLayout = () => {
-		// The 'columns' property can be undefined or 0 when not using a TTY.
-		// In that case we fall back to 80.
-		const terminalWidth = this.options.stdout.columns || 80;
+		const terminalWidth = this.getTerminalWidth();
 
 		this.rootNode.yogaNode!.setWidth(terminalWidth);
 
@@ -143,7 +193,13 @@ export default class Ink {
 			return;
 		}
 
-		const {output, outputHeight, staticOutput} = render(this.rootNode);
+		const startTime = performance.now();
+		const {output, outputHeight, staticOutput} = render(
+			this.rootNode,
+			this.isScreenReaderEnabled,
+		);
+
+		this.options.onRender?.({renderTime: performance.now() - startTime});
 
 		// If <Static> output isn't empty, it means new children have been added to it
 		const hasStaticOutput = staticOutput && staticOutput !== '\n';
@@ -163,6 +219,47 @@ export default class Ink {
 			}
 
 			this.lastOutput = output;
+			this.lastOutputHeight = outputHeight;
+			return;
+		}
+
+		if (this.isScreenReaderEnabled) {
+			if (hasStaticOutput) {
+				// We need to erase the main output before writing new static output
+				const erase =
+					this.lastOutputHeight > 0
+						? ansiEscapes.eraseLines(this.lastOutputHeight)
+						: '';
+				this.options.stdout.write(erase + staticOutput);
+				// After erasing, the last output is gone, so we should reset its height
+				this.lastOutputHeight = 0;
+			}
+
+			if (output === this.lastOutput && !hasStaticOutput) {
+				return;
+			}
+
+			const terminalWidth = this.options.stdout.columns || 80;
+
+			const wrappedOutput = wrapAnsi(output, terminalWidth, {
+				trim: false,
+				hard: true,
+			});
+
+			// If we haven't erased yet, do it now.
+			if (hasStaticOutput) {
+				this.options.stdout.write(wrappedOutput);
+			} else {
+				const erase =
+					this.lastOutputHeight > 0
+						? ansiEscapes.eraseLines(this.lastOutputHeight)
+						: '';
+				this.options.stdout.write(erase + wrappedOutput);
+			}
+
+			this.lastOutput = output;
+			this.lastOutputHeight =
+				wrappedOutput === '' ? 0 : wrappedOutput.split('\n').length;
 			return;
 		}
 
@@ -170,11 +267,13 @@ export default class Ink {
 			this.fullStaticOutput += staticOutput;
 		}
 
-		if (outputHeight >= this.options.stdout.rows) {
+		if (this.lastOutputHeight >= this.options.stdout.rows) {
 			this.options.stdout.write(
 				ansiEscapes.clearTerminal + this.fullStaticOutput + output,
 			);
 			this.lastOutput = output;
+			this.lastOutputHeight = outputHeight;
+			this.log.sync(output);
 			return;
 		}
 
@@ -190,24 +289,34 @@ export default class Ink {
 		}
 
 		this.lastOutput = output;
+		this.lastOutputHeight = outputHeight;
 	};
 
 	render(node: ReactNode): void {
 		const tree = (
-			<App
-				stdin={this.options.stdin}
-				stdout={this.options.stdout}
-				stderr={this.options.stderr}
-				writeToStdout={this.writeToStdout}
-				writeToStderr={this.writeToStderr}
-				exitOnCtrlC={this.options.exitOnCtrlC}
-				onExit={this.unmount}
+			<AccessibilityContext.Provider
+				value={{isScreenReaderEnabled: this.isScreenReaderEnabled}}
 			>
-				{node}
-			</App>
+				<App
+					stdin={this.options.stdin}
+					stdout={this.options.stdout}
+					stderr={this.options.stderr}
+					writeToStdout={this.writeToStdout}
+					writeToStderr={this.writeToStderr}
+					exitOnCtrlC={this.options.exitOnCtrlC}
+					onExit={this.unmount}
+				>
+					{node}
+				</App>
+			</AccessibilityContext.Provider>
 		);
 
-		reconciler.updateContainer(tree, this.container, null, noop);
+		// @ts-expect-error the types for `react-reconciler` are not up to date with the library.
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+		reconciler.updateContainerSync(tree, this.container, null, noop);
+		// @ts-expect-error the types for `react-reconciler` are not up to date with the library.
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+		reconciler.flushSyncWork();
 	}
 
 	writeToStdout(data: string): void {
@@ -279,7 +388,12 @@ export default class Ink {
 
 		this.isUnmounted = true;
 
-		reconciler.updateContainer(null, this.container, null, noop);
+		// @ts-expect-error the types for `react-reconciler` are not up to date with the library.
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+		reconciler.updateContainerSync(null, this.container, null, noop);
+		// @ts-expect-error the types for `react-reconciler` are not up to date with the library.
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+		reconciler.flushSyncWork();
 		instances.delete(this.options.stdout);
 
 		if (error instanceof Error) {

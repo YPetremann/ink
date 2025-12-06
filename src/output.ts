@@ -10,13 +10,12 @@ import {
 import {type OutputTransformer} from './render-node-to-output.js';
 
 /**
- * "Virtual" output class
- *
- * Handles the positioning and saving of the output of each node in the tree.
- * Also responsible for applying transformations to each character of the output.
- *
- * Used to generate the final output of all nodes before writing it to actual output stream (e.g. stdout)
- */
+"Virtual" output class
+
+Handles the positioning and saving of the output of each node in the tree. Also responsible for applying transformations to each character of the output.
+
+Used to generate the final output of all nodes before writing it to actual output stream (e.g. stdout)
+*/
 
 type Options = {
 	width: number;
@@ -205,21 +204,22 @@ export default class Output {
 					for (const character of characters) {
 						currentLine[offsetX] = character;
 
-						// Some characters take up more than one column. In that case, the following
-						// pixels need to be cleared to avoid printing extra characters
-						const isWideCharacter =
-							character.fullWidth || character.value.length > 1;
+						// Determine printed width using string-width to align with measurement
+						const characterWidth = Math.max(1, stringWidth(character.value));
 
-						if (isWideCharacter) {
-							currentLine[offsetX + 1] = {
-								type: 'char',
-								value: '',
-								fullWidth: false,
-								styles: character.styles,
-							};
+						// For multi-column characters, clear following cells to avoid stray spaces/artifacts
+						if (characterWidth > 1) {
+							for (let index = 1; index < characterWidth; index++) {
+								currentLine[offsetX + index] = {
+									type: 'char',
+									value: '',
+									fullWidth: false,
+									styles: character.styles,
+								};
+							}
 						}
 
-						offsetX += isWideCharacter ? 2 : 1;
+						offsetX += characterWidth;
 					}
 
 					offsetY++;

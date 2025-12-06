@@ -82,6 +82,30 @@ test.serial('useInput - handle uppercase character', async t => {
 	t.true(ps.output.includes('exited'));
 });
 
+test.serial(
+	'useInput - \r should not count as an uppercase character',
+	async t => {
+		const ps = term('use-input', ['uppercase']);
+		ps.write('\r');
+		await ps.waitForExit();
+		t.true(ps.output.includes('exited'));
+	},
+);
+
+test.serial('useInput - pasted carriage return', async t => {
+	const ps = term('use-input', ['pastedCarriageReturn']);
+	ps.write('\rtest');
+	await ps.waitForExit();
+	t.true(ps.output.includes('exited'));
+});
+
+test.serial('useInput - pasted tab', async t => {
+	const ps = term('use-input', ['pastedTab']);
+	ps.write('\ttest');
+	await ps.waitForExit();
+	t.true(ps.output.includes('exited'));
+});
+
 test.serial('useInput - handle escape', async t => {
 	const ps = term('use-input', ['escape']);
 	ps.write('\u001B');
